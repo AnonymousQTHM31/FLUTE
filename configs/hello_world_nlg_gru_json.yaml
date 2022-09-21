@@ -1,0 +1,152 @@
+# Basic configuration file for running nlg_gru example using json files.
+# Parameters needed to initialize the model
+model_config: 
+    model_type: GRU
+    model_folder: experiments/nlg_gru/model.py
+    pretrained_model_path: <add path to pretrained weights here>
+    embed_dim: 160
+    vocab_size: 10000
+    hidden_dim: 512
+    OOV_correct: false
+
+# Configuration for differential privacy
+dp_config:
+    enable_local_dp: false      # If enabled, the rest of parameters is needed. 
+    # enable_local_dp: true     # Local dp clips and adds noise on the client and centrally accumulates the privacy budget
+    # eps: 100                  # epsilon
+    # max_grad: 0.008           # max gradient
+    # weight_scaler: 0.0001     # indicates how the aggregation weights scaled before noise addition, and unscaled afterwards.
+    # max_weight: 0.0001        # The max_weight and min_weight should be already scaled by weight_scaler
+    # min_weight: 0.00009       # Because we scale down the weight using weight_scalar -> clip -> add noise -> scale back up.
+
+# Additional privacy metrics
+privacy_metrics_config:
+    apply_metrics: false             # If enabled, the rest of parameters is needed. 
+    # apply_indices_extraction: true   # If we extract word indices we want to consider the rank of the words extracted.
+    # allowed_word_rank: 9000          # Any word that rank above this value is considered privacy risk
+    # apply_leakage_metric: true
+    # max_leakage: 30
+    # max_allowed_leakage: 3
+    # adaptive_leakage_threshold: 0.95 # Takes the 95th percentile of the leakage for the next round.
+    # is_leakage_weighted: true
+    # attacker_optimizer_config:
+    #     lr: 0.03
+    #     type: adamax
+    #     amsgrad: false
+
+# Select the Federated optimizer to use (e.g. DGA or FedAvg)
+strategy: DGA
+
+# Determines all the server-side settings for training and evaluation rounds
+server_config:   
+    wantRL: false                   # Enable/Disable Reinforcement learning
+    resume_from_checkpoint: true    # Resumes from latest checkpoint iteration if available 
+    do_profiling: false             # Capture profiling information during server updates.
+    optimizer_config:               # Configuration for server-side optimizer
+        type: lamb
+        lr: 0.1
+        weight_decay: 0.005
+    annealing_config:               # This section configures how the learning rate decays
+        type: step_lr
+        step_interval: epoch
+        gamma: 1.0
+        step_size: 100
+    val_freq: 2                     # Frequency for validation rounds
+    rec_freq: 4                     # Frequency for testing rounds
+    initial_val : true              # Enable initial validation round at itr=0
+    initial_rec: false             # Enable initial testing round at itr=0
+    max_iteration: 11               # Total number of rounds for FL
+    num_clients_per_iteration: 10   # Number of clients sampled per round
+    data_config:                    # Server-side data configuration
+        val:                        # Validation data
+            batch_size: 2048
+            tokenizer_type: not_applicable
+            prepend_datapath: false
+            val_data: <add path to data here>       # Path for validation data
+            vocab_dict: <add path to vocab here>    # Path for vocabulary
+            pin_memory: true
+            num_workers: 0                          # Indicates how many workers are used for creating batches
+            num_frames: 2400                        
+            max_batch_size: 2048
+            max_num_words:  25
+            unsorted_batch: true
+        # Note this is NOT the main training data configuration, which is configured in the 
+        # client config.  This section is ignored unless you are running replay data.
+        # If you want to run replay data- set a path name for train_data_server.
+        # train:                                      
+        #     batch_size: 128
+        #     loader_type: text
+        #     tokenizer_type: not_applicable
+        #     prepend_datapath: false
+        #     train_data: null
+        #     train_data_server: null
+        #     vocab_dict: <add path to vocab here>
+        #     pin_memory: true
+        #     num_workers: 0
+        #     num_frames: 2400
+        #     desired_max_samples: 500
+        #     max_grad_norm: 10.0
+        #     max_batch_size: 128
+        #     max_num_words:  25
+        #     unsorted_batch: true
+        test:                                       # Test data configuration
+            batch_size: 2048
+            tokenizer_type: not_applicable
+            prepend_datapath: false
+            train_data: null
+            train_data_server: null
+            test_data: <add path to data here>      # Path for validation data
+            vocab_dict: <add path to vocab here>    # Path for vocabulary
+            pin_memory: true
+            num_workers: 0                          # Indicates how many workers are used for creating batches
+            max_batch_size: 2048
+            max_num_words:  25
+            unsorted_batch: true
+    type: model_optimization
+    aggregate_median: softmax                       # FL aggregation method
+    weight_train_loss: train_loss                   # Determines how each client's weight is computed (e.g. grad_mean_loss, train_loss)
+    softmax_beta: 20.0
+    initial_lr_client: 1.0
+    lr_decay_factor: 1.0
+    best_model_criterion: loss                      # Determine the best model based on minimal loss, for checkpointing
+    fall_back_to_best_model: false                  # If a model degrades, use the previous best model
+    # server_replay_config:                           # This is only applies if the server-side training data is fully configured and loaded
+    #     server_iterations: 50
+    #     optimizer_config:
+    #         type: adam
+    #         lr: 0.00002
+    #         amsgrad: true
+    
+# Dictates the learning parameters for client-side model updates. Train data is defined inside this config.
+client_config:
+    meta_learning: basic
+    stats_on_smooth_grad: true
+    ignore_subtask: false
+    num_skips_threshold: 10
+    copying_train_data: false
+    do_profiling: false                                 # Enables client-side training profiling
+    data_config:
+        train:                                          # This is the main training data configuration
+            batch_size: 64
+            tokenizer_type: not_applicable
+            prepend_datapath: false
+            list_of_train_data: <add path to data here> # Path to training data
+            vocab_dict: <add path to vocab here>        # Path to vocabulary
+            pin_memory: true
+            num_workers: 0
+            desired_max_samples: 50000
+            max_grad_norm: 20.0
+            max_batch_size: 128
+            max_num_words:  25
+            unsorted_batch: true
+    type: optimization
+    meta_optimizer_config:
+        lr: 1.0
+        type: sgd
+    optimizer_config:
+        type: sgd
+    annealing_config:
+        type: step_lr
+        step_interval: epoch
+        step_size: 1
+        gamma: 1.0
