@@ -1,0 +1,1164 @@
+diff --git a/examples/simulation_lr_mnist/README.md b/examples/simulation_lr_mnist/README.md
+new file mode 100644
+index 0000000..56241bb
+--- /dev/null
++++ b/examples/simulation_lr_mnist/README.md
+@@ -0,0 +1,34 @@
++# example_simulation_ray
++
++This code splits CIFAR-10 dataset into `pool_size` partitions (user defined) and does a few rounds of CIFAR-10 training. In this example, we leverage [`Ray`](https://docs.ray.io/en/latest/index.html) to simulate Flower Clients participating in FL rounds in an resource-aware fashion. This is possible via the [`RayClientProxy`](https://github.com/adap/flower/blob/main/src/py/flwr/simulation/ray_transport/ray_client_proxy.py) which bridges a standard Flower server with standard Flower clients while excluding the gRPC communication protocol and the Client Manager in favour of Ray's scheduling and communication layers.
++
++## Requirements
++
++*    Flower 0.18.0
++*    A recent version of PyTorch. This example has been tested with Pytorch 1.7.1, 1.8.2 (LTS) and 1.10.2.
++*    A recent version of Ray. This example has been tested with Ray 1.4.1, 1.6 and 1.9.2.
++
++From a clean virtualenv or Conda environment with Python 3.7+, the following command will isntall all the dependencies needed:
++```bash
++$ pip install -r requirements.txt
++```
++
++# How to run
++
++This example:
++
++1. Downloads CIFAR-10
++2. Partitions the dataset into N splits, where N is the total number of
++   clients. We refere to this as `pool_size`. The partition can be IID or non-IID
++4. Starts a Ray-based simulation where a % of clients are sample each round.
++   This example uses N=10, so 10 clients will be sampled each round.
++5. After the M rounds end, the global model is evaluated on the entire testset.
++   Also, the global model is evaluated on the valset partition residing in each
++   client. This is useful to get a sense on how well the global model can generalise
++   to each client's data.
++
++The command below will assign each client 2 CPU threads. If your system does not have 2xN(=10) = 20 threads to run all 10 clients in parallel, they will be queued but eventually run. The server will wait until all N clients have completed their local training stage before aggregating the results. After that, a new round will begin.
++
++```bash
++$ python main.py --num_client_cpus 2 # note that `num_client_cpus` should be <= the number of threads in your system.
++```
+diff --git a/examples/simulation_lr_mnist/common.py b/examples/simulation_lr_mnist/common.py
+new file mode 100644
+index 0000000..dc948eb
+--- /dev/null
++++ b/examples/simulation_lr_mnist/common.py
+@@ -0,0 +1,488 @@
++# Copyright 2020 Adap GmbH. All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# ==============================================================================
++"""Commonly used functions for generating partitioned datasets."""
++
++# pylint: disable=invalid-name
++
++
++from typing import List, Optional, Tuple, Union
++
++import numpy as np
++from numpy.random import BitGenerator, Generator, SeedSequence
++
++XY = Tuple[np.ndarray, np.ndarray]
++XYList = List[XY]
++PartitionedDataset = Tuple[XYList, XYList]
++
++np.random.seed(2020)
++
++
++def float_to_int(i: float) -> int:
++    """Return float as int but raise if decimal is dropped."""
++    if not i.is_integer():
++        raise Exception("Cast would drop decimals")
++
++    return int(i)
++
++
++def sort_by_label(x: np.ndarray, y: np.ndarray) -> XY:
++    """Sort by label.
++
++    Assuming two labels and four examples the resulting label order
++    would be 1,1,2,2
++    """
++    idx = np.argsort(y, axis=0).reshape((y.shape[0]))
++    return (x[idx], y[idx])
++
++
++def sort_by_label_repeating(x: np.ndarray, y: np.ndarray) -> XY:
++    """Sort by label in repeating groups. Assuming two labels and four examples
++    the resulting label order would be 1,2,1,2.
++
++    Create sorting index which is applied to by label sorted x, y
++
++    .. code-block:: python
++
++        # given:
++        y = [
++            0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9
++        ]
++
++        # use:
++        idx = [
++            0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 1, 3, 5, 7, 9, 11, 13, 15, 17, 19
++        ]
++
++        # so that y[idx] becomes:
++        y = [
++            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9
++        ]
++    """
++    x, y = sort_by_label(x, y)
++
++    num_example = x.shape[0]
++    num_class = np.unique(y).shape[0]
++    idx = (
++        np.array(range(num_example), np.int64)
++        .reshape((num_class, num_example // num_class))
++        .transpose()
++        .reshape(num_example)
++    )
++
++    return (x[idx], y[idx])
++
++
++def split_at_fraction(x: np.ndarray, y: np.ndarray, fraction: float) -> Tuple[XY, XY]:
++    """Split x, y at a certain fraction."""
++    splitting_index = float_to_int(x.shape[0] * fraction)
++    # Take everything BEFORE splitting_index
++    x_0, y_0 = x[:splitting_index], y[:splitting_index]
++    # Take everything AFTER splitting_index
++    x_1, y_1 = x[splitting_index:], y[splitting_index:]
++    return (x_0, y_0), (x_1, y_1)
++
++
++def shuffle(x: np.ndarray, y: np.ndarray) -> XY:
++    """Shuffle x and y."""
++    idx = np.random.permutation(len(x))
++    return x[idx], y[idx]
++
++
++def partition(x: np.ndarray, y: np.ndarray, num_partitions: int) -> List[XY]:
++    """Return x, y as list of partitions."""
++    return list(zip(np.split(x, num_partitions), np.split(y, num_partitions)))
++
++
++def combine_partitions(xy_list_0: XYList, xy_list_1: XYList) -> XYList:
++    """Combine two lists of ndarray Tuples into one list."""
++    return [
++        (np.concatenate([x_0, x_1], axis=0), np.concatenate([y_0, y_1], axis=0))
++        for (x_0, y_0), (x_1, y_1) in zip(xy_list_0, xy_list_1)
++    ]
++
++
++def shift(x: np.ndarray, y: np.ndarray) -> XY:
++    """Shift x_1, y_1 so that the first half contains only labels 0 to 4 and
++    the second half 5 to 9."""
++    x, y = sort_by_label(x, y)
++
++    (x_0, y_0), (x_1, y_1) = split_at_fraction(x, y, fraction=0.5)
++    (x_0, y_0), (x_1, y_1) = shuffle(x_0, y_0), shuffle(x_1, y_1)
++    x, y = np.concatenate([x_0, x_1], axis=0), np.concatenate([y_0, y_1], axis=0)
++    return x, y
++
++
++def create_partitions(
++    unpartitioned_dataset: XY,
++    iid_fraction: float,
++    num_partitions: int,
++) -> XYList:
++    """Create partitioned version of a training or test set.
++
++    Currently tested and supported are MNIST, FashionMNIST and
++    CIFAR-10/100
++    """
++    x, y = unpartitioned_dataset
++
++    x, y = shuffle(x, y)
++    x, y = sort_by_label_repeating(x, y)
++
++    (x_0, y_0), (x_1, y_1) = split_at_fraction(x, y, fraction=iid_fraction)
++
++    # Shift in second split of dataset the classes into two groups
++    x_1, y_1 = shift(x_1, y_1)
++
++    xy_0_partitions = partition(x_0, y_0, num_partitions)
++    xy_1_partitions = partition(x_1, y_1, num_partitions)
++
++    xy_partitions = combine_partitions(xy_0_partitions, xy_1_partitions)
++
++    # Adjust x and y shape
++    return [adjust_xy_shape(xy) for xy in xy_partitions]
++
++
++def create_partitioned_dataset(
++    keras_dataset: Tuple[XY, XY],
++    iid_fraction: float,
++    num_partitions: int,
++) -> Tuple[PartitionedDataset, XY]:
++    """Create partitioned version of keras dataset.
++
++    Currently tested and supported are MNIST, FashionMNIST and
++    CIFAR-10/100
++    """
++    xy_train, xy_test = keras_dataset
++
++    xy_train_partitions = create_partitions(
++        unpartitioned_dataset=xy_train,
++        iid_fraction=iid_fraction,
++        num_partitions=num_partitions,
++    )
++
++    xy_test_partitions = create_partitions(
++        unpartitioned_dataset=xy_test,
++        iid_fraction=iid_fraction,
++        num_partitions=num_partitions,
++    )
++
++    return (xy_train_partitions, xy_test_partitions), adjust_xy_shape(xy_test)
++
++
++def log_distribution(xy_partitions: XYList) -> None:
++    """Print label distribution for list of paritions."""
++    distro = [np.unique(y, return_counts=True) for _, y in xy_partitions]
++    for d in distro:
++        print(d)
++
++
++def adjust_xy_shape(xy: XY) -> XY:
++    """Adjust shape of both x and y."""
++    x, y = xy
++    if x.ndim == 3:
++        x = adjust_x_shape(x)
++    if y.ndim == 2:
++        y = adjust_y_shape(y)
++    return (x, y)
++
++
++def adjust_x_shape(nda: np.ndarray) -> np.ndarray:
++    """Turn shape (x, y, z) into (x, y, z, 1)."""
++    nda_adjusted = np.reshape(nda, (nda.shape[0], nda.shape[1], nda.shape[2], 1))
++    return nda_adjusted
++
++
++def adjust_y_shape(nda: np.ndarray) -> np.ndarray:
++    """Turn shape (x, 1) into (x)."""
++    nda_adjusted = np.reshape(nda, (nda.shape[0]))
++    return nda_adjusted
++
++
++def split_array_at_indices(
++    x: np.ndarray, split_idx: np.ndarray
++) -> List[List[np.ndarray]]:
++    """Splits an array `x` into list of elements using starting indices from
++    `split_idx`.
++
++        This function should be used with `unique_indices` from `np.unique()` after
++        sorting by label.
++
++    Args:
++        x (np.ndarray): Original array of dimension (N,a,b,c,...)
++        split_idx (np.ndarray): 1-D array contaning increasing number of
++            indices to be used as partitions. Initial value must be zero. Last value
++            must be less than N.
++
++    Returns:
++        List[List[np.ndarray]]: List of list of samples.
++    """
++
++    if split_idx.ndim != 1:
++        raise ValueError("Variable `split_idx` must be a 1-D numpy array.")
++    if split_idx.dtype != np.int64:
++        raise ValueError("Variable `split_idx` must be of type np.int64.")
++    if split_idx[0] != 0:
++        raise ValueError("First value of `split_idx` must be 0.")
++    if split_idx[-1] >= x.shape[0]:
++        raise ValueError(
++            """Last value in `split_idx` must be less than
++            the number of samples in `x`."""
++        )
++    if not np.all(split_idx[:-1] <= split_idx[1:]):
++        raise ValueError("Items in `split_idx` must be in increasing order.")
++
++    num_splits: int = len(split_idx)
++    split_idx = np.append(split_idx, x.shape[0])
++
++    list_samples_split: List[List[np.ndarray]] = [[] for _ in range(num_splits)]
++    for j in range(num_splits):
++        tmp_x = x[split_idx[j] : split_idx[j + 1]]  # noqa: E203
++        for sample in tmp_x:
++            list_samples_split[j].append(sample)
++
++    return list_samples_split
++
++
++def exclude_classes_and_normalize(
++    distribution: np.ndarray, exclude_dims: List[bool], eps: float = 1e-5
++) -> np.ndarray:
++    """Excludes classes from a distribution.
++
++    This function is particularly useful when sampling without replacement.
++    Classes for which no sample is available have their probabilities are set to 0.
++    Classes that had probabilities originally set to 0 are incremented with
++     `eps` to allow sampling from remaining items.
++
++    Args:
++        distribution (np.array): Distribution being used.
++        exclude_dims (List[bool]): Dimensions to be excluded.
++        eps (float, optional): Small value to be addad to non-excluded dimensions.
++            Defaults to 1e-5.
++
++    Returns:
++        np.ndarray: Normalized distributions.
++    """
++    if np.any(distribution < 0) or (not np.isclose(np.sum(distribution), 1.0)):
++        raise ValueError("distribution must sum to 1 and have only positive values.")
++
++    if distribution.size != len(exclude_dims):
++        raise ValueError(
++            """Length of distribution must be equal
++            to the length `exclude_dims`."""
++        )
++    if eps < 0:
++        raise ValueError("""The value of `eps` must be positive and small.""")
++
++    distribution[[not x for x in exclude_dims]] += eps
++    distribution[exclude_dims] = 0.0
++    sum_rows = np.sum(distribution) + np.finfo(float).eps
++    distribution = distribution / sum_rows
++
++    return distribution
++
++
++def sample_without_replacement(
++    distribution: np.ndarray,
++    list_samples: List[List[np.ndarray]],
++    num_samples: int,
++    empty_classes: List[bool],
++) -> Tuple[XY, List[bool]]:
++    """Samples from a list without replacement using a given distribution.
++
++    Args:
++        distribution (np.ndarray): Distribution used for sampling.
++        list_samples(List[List[np.ndarray]]): List of samples.
++        num_samples (int): Total number of items to be sampled.
++        empty_classes (List[bool]): List of booleans indicating which classes are empty.
++            This is useful to differentiate which classes should still be sampled.
++
++    Returns:
++        XY: Dataset contaning samples
++        List[bool]: empty_classes.
++    """
++    if np.sum([len(x) for x in list_samples]) < num_samples:
++        raise ValueError(
++            """Number of samples in `list_samples` is less than `num_samples`"""
++        )
++
++    # Make sure empty classes are not sampled
++    # and solves for rare cases where
++    if not empty_classes:
++        empty_classes = len(distribution) * [False]
++
++    distribution = exclude_classes_and_normalize(
++        distribution=distribution, exclude_dims=empty_classes
++    )
++
++    data: List[np.ndarray] = []
++    target: List[np.ndarray] = []
++
++    for _ in range(num_samples):
++        sample_class = np.where(np.random.multinomial(1, distribution) == 1)[0][0]
++        sample: np.ndarray = list_samples[sample_class].pop()
++
++        data.append(sample)
++        target.append(sample_class)
++
++        # If last sample of the class was drawn, then set the
++        #  probability density function (PDF) to zero for that class.
++        if len(list_samples[sample_class]) == 0:
++            empty_classes[sample_class] = True
++            # Be careful to distinguish between classes that had zero probability
++            # and classes that are now empty
++            distribution = exclude_classes_and_normalize(
++                distribution=distribution, exclude_dims=empty_classes
++            )
++    data_array: np.ndarray = np.concatenate([data], axis=0)
++    target_array: np.ndarray = np.array(target, dtype=np.int64)
++
++    return (data_array, target_array), empty_classes
++
++
++def get_partitions_distributions(partitions: XYList) -> Tuple[np.ndarray, List[int]]:
++    """Evaluates the distribution over classes for a set of partitions.
++
++    Args:
++        partitions (XYList): Input partitions
++
++    Returns:
++        np.ndarray: Distributions of size (num_partitions, num_classes)
++    """
++    # Get largest available label
++    labels = set()
++    for _, y in partitions:
++        labels.update(set(y))
++    list_labels = sorted(list(labels))
++    bin_edges = np.arange(len(list_labels) + 1)
++
++    # Pre-allocate distributions
++    distributions = np.zeros((len(partitions), len(list_labels)), dtype=np.float32)
++    for idx, (_, _y) in enumerate(partitions):
++        hist, _ = np.histogram(_y, bin_edges)
++        distributions[idx] = hist / hist.sum()
++
++    return distributions, list_labels
++
++
++def create_lda_partitions(
++    dataset: XY,
++    dirichlet_dist: Optional[np.ndarray] = None,
++    num_partitions: int = 100,
++    concentration: Union[float, np.ndarray, List[float]] = 0.5,
++    accept_imbalanced: bool = False,
++    seed: Optional[Union[int, SeedSequence, BitGenerator, Generator]] = None,
++) -> Tuple[XYList, np.ndarray]:
++    """Create imbalanced non-iid partitions using Latent Dirichlet Allocation
++    (LDA) without resampling.
++
++    Args:
++        dataset (XY): Dataset containing samples X and labels Y.
++        dirichlet_dist (numpy.ndarray, optional): previously generated distribution to
++            be used. This is useful when applying the same distribution for train and
++            validation sets.
++        num_partitions (int, optional): Number of partitions to be created.
++            Defaults to 100.
++        concentration (float, np.ndarray, List[float]): Dirichlet Concentration
++            (:math:`\\alpha`) parameter. Set to float('inf') to get uniform partitions.
++            An :math:`\\alpha \\to \\Inf` generates uniform distributions over classes.
++            An :math:`\\alpha \\to 0.0` generates one class per client. Defaults to 0.5.
++        accept_imbalanced (bool): Whether or not to accept imbalanced output classes.
++            Default False.
++        seed (None, int, SeedSequence, BitGenerator, Generator):
++            A seed to initialize the BitGenerator for generating the Dirichlet
++            distribution. This is defined in Numpy's official documentation as follows:
++            If None, then fresh, unpredictable entropy will be pulled from the OS.
++            One may also pass in a SeedSequence instance.
++            Additionally, when passed a BitGenerator, it will be wrapped by Generator.
++            If passed a Generator, it will be returned unaltered.
++            See official Numpy Documentation for further details.
++
++    Returns:
++        Tuple[XYList, numpy.ndarray]: List of XYList containing partitions
++            for each dataset and the dirichlet probability density functions.
++    """
++    # pylint: disable=too-many-arguments,too-many-locals
++
++    x, y = dataset
++    x, y = shuffle(x, y)
++    x, y = sort_by_label(x, y)
++
++    if (x.shape[0] % num_partitions) and (not accept_imbalanced):
++        raise ValueError(
++            """Total number of samples must be a multiple of `num_partitions`.
++               If imbalanced classes are allowed, set
++               `accept_imbalanced=True`."""
++        )
++
++    num_samples = num_partitions * [0]
++    for j in range(x.shape[0]):
++        num_samples[j % num_partitions] += 1
++
++    # Get number of classes and verify if they matching with
++    classes, start_indices = np.unique(y, return_index=True)
++
++    # Make sure that concentration is np.array and
++    # check if concentration is appropriate
++    concentration = np.asarray(concentration)
++
++    # Check if concentration is Inf, if so create uniform partitions
++    partitions: List[XY] = [(_, _) for _ in range(num_partitions)]
++    if float("inf") in concentration:
++
++        partitions = create_partitions(
++            unpartitioned_dataset=(x, y),
++            iid_fraction=1.0,
++            num_partitions=num_partitions,
++        )
++        dirichlet_dist = get_partitions_distributions(partitions)[0]
++
++        return partitions, dirichlet_dist
++
++    if concentration.size == 1:
++        concentration = np.repeat(concentration, classes.size)
++    elif concentration.size != classes.size:  # Sequence
++        raise ValueError(
++            f"The size of the provided concentration ({concentration.size}) ",
++            f"must be either 1 or equal number of classes {classes.size})",
++        )
++
++    # Split into list of list of samples per class
++    list_samples_per_class: List[List[np.ndarray]] = split_array_at_indices(
++        x, start_indices
++    )
++
++    if dirichlet_dist is None:
++        dirichlet_dist = np.random.default_rng(seed).dirichlet(
++            alpha=concentration, size=num_partitions
++        )
++
++    if dirichlet_dist.size != 0:
++        if dirichlet_dist.shape != (num_partitions, classes.size):
++            raise ValueError(
++                f"""The shape of the provided dirichlet distribution
++                 ({dirichlet_dist.shape}) must match the provided number
++                  of partitions and classes ({num_partitions},{classes.size})"""
++            )
++
++    # Assuming balanced distribution
++    empty_classes = classes.size * [False]
++    for partition_id in range(num_partitions):
++        partitions[partition_id], empty_classes = sample_without_replacement(
++            distribution=dirichlet_dist[partition_id].copy(),
++            list_samples=list_samples_per_class,
++            num_samples=num_samples[partition_id],
++            empty_classes=empty_classes,
++        )
++
++    return partitions, dirichlet_dist
+diff --git a/examples/simulation_lr_mnist/dataloader.py b/examples/simulation_lr_mnist/dataloader.py
+new file mode 100644
+index 0000000..d9b0da5
+--- /dev/null
++++ b/examples/simulation_lr_mnist/dataloader.py
+@@ -0,0 +1,25 @@
++# Copyright (c) Microsoft Corporation.
++# Licensed under the MIT license.
++
++import torch
++from torch.utils.data import DataLoader as PyTorchDataLoader
++import numpy as np
++
++class DataLoader(PyTorchDataLoader):
++    def __init__(self, dataset, batch_size, num_workers, mode):
++
++        dataset = dataset
++
++        super().__init__(
++            dataset,
++            batch_size=batch_size,
++            shuffle=(mode=='train'),
++            num_workers=num_workers,
++            collate_fn=self.collate_fn,
++        )
++
++    def collate_fn(self, batch):
++        x, y = list(zip(*batch))
++        x = np.array(x)
++        y = np.array(y)
++        return {'x': torch.tensor(x), 'y': torch.tensor(y)}
+\ No newline at end of file
+diff --git a/examples/simulation_lr_mnist/dataset.py b/examples/simulation_lr_mnist/dataset.py
+new file mode 100644
+index 0000000..e85baf9
+--- /dev/null
++++ b/examples/simulation_lr_mnist/dataset.py
+@@ -0,0 +1,49 @@
++# Copyright (c) Microsoft Corporation.
++# Licensed under the MIT license.
++
++import numpy as np
++from torch.utils.data import Dataset as PyTorchDataset
++from download_data import MNIST
++
++class Dataset(PyTorchDataset):
++    def __init__(self, data, test_only=False, user_idx=0, **kwargs):
++        self.test_only = test_only
++        self.user_idx = user_idx
++
++        # Get all data
++        self.user_list, self.user_data, self.user_data_label, self.num_samples = self.load_data(data, self.test_only)
++
++        if self.test_only:  # combine all data into single array
++            self.user = 'test_only'
++            self.features = np.vstack([user_data for user_data in self.user_data.values()])
++            self.labels = np.hstack([user_label for user_label in self.user_data_label.values()])
++        else:  # get a single user's data
++            if user_idx is None:
++                raise ValueError('in train mode, user_idx must be specified')
++
++            self.user = self.user_list[user_idx]
++            self.features = self.user_data
++            self.labels = self.user_data_label
++
++    def __getitem__(self, idx):
++        try:
++            return np.array(self.features[idx]).astype(np.float32).T, self.labels[idx]
++        except:
++            print(f"Indexessssssssss {idx} - {len(self.features)} - {len(self.labels)}")
++
++    def __len__(self):
++        return len(self.features)
++
++    def load_data(self, data, test_only):
++        '''Wrapper method to read/instantiate the dataset'''
++
++        if data == None:
++            dataset = MNIST()
++            data = dataset.testset if test_only else dataset.trainset
++        
++        users = data['users']
++        features = data['user_data']
++        labels = data['user_data_label']
++        num_samples = data['num_samples']
++            
++        return users, features, labels, num_samples
+\ No newline at end of file
+diff --git a/examples/simulation_lr_mnist/dataset_utils.py b/examples/simulation_lr_mnist/dataset_utils.py
+new file mode 100644
+index 0000000..66d1984
+--- /dev/null
++++ b/examples/simulation_lr_mnist/dataset_utils.py
+@@ -0,0 +1,50 @@
++from pathlib import Path
++import numpy as np
++import torch
++
++import shutil
++from PIL import Image
++from torchvision.datasets import VisionDataset
++from typing import Callable, Optional, Tuple, Any
++from common import create_lda_partitions
++from download_data import MNIST
++from dataset import Dataset
++from dataloader import DataLoader
++
++def get_dataset(train_set, cid, partition: str):
++
++    cid = int(cid)
++    user = train_set['users'][int(cid)]
++    num_samples = train_set['num_samples'][int(cid)]
++    user_data = train_set['user_data'][user]
++    user_data_label = train_set['user_data_label'][user]
++    user_dict = {'users': [user], 'num_samples': [num_samples], 'user_data': user_data, 'user_data_label':user_data_label}
++
++    test_only = False if partition == "train" else True
++
++    return Dataset(data=user_dict, test_only=test_only, user_idx = 0)
++
++
++def get_dataloader(
++    trainset, cid, is_train: bool, batch_size: int, workers: int
++):
++    """Generates trainset/valset object and returns appropiate dataloader."""
++
++    
++    partition = "train" if is_train else "val"
++    dataset = get_dataset(trainset, cid, partition)
++
++    return DataLoader(dataset, batch_size=batch_size, num_workers=workers, mode=partition)
++
++
++def get_mnist(path_to_data="./data"):
++    """Downloads CIFAR10 dataset and generates a unified training set (it will
++    be partitioned later using the LDA partitioning mechanism."""
++
++    datasets = MNIST()
++    train_set = datasets.trainset
++    test_set = datasets.testset
++    test_set = Dataset(data=test_set, test_only=True)
++    training_data = "./data"
++
++    return train_set, test_set
+diff --git a/examples/simulation_lr_mnist/download_data.py b/examples/simulation_lr_mnist/download_data.py
+new file mode 100644
+index 0000000..b8483a9
+--- /dev/null
++++ b/examples/simulation_lr_mnist/download_data.py
+@@ -0,0 +1,69 @@
++import os
++import wget
++import zipfile
++import numpy as np
++import json
++import wget
++
++FEDML_DATA_MNIST_URL = "https://fedcv.s3.us-west-1.amazonaws.com/MNIST.zip"
++data_cache_dir = "./data"
++
++''' 
++    The MNIST dataset is taken from FedML repository. For more information regarding this dataset, 
++    please refer to https://github.com/FedML-AI/FedML/tree/master/python/fedml/data/MNIST.
++
++    In order to download the data run the following commands:
++        - wget --no-check-certificate --no-proxy https://fedcv.s3.us-west-1.amazonaws.com/MNIST.zip
++        - unzip MNIST.zip
++'''
++
++class MNIST:
++    def __init__(self) :
++        
++        download_mnist(data_cache_dir)
++        self.trainset, self.testset = read_data(
++            train_data_dir = os.path.join(data_cache_dir,'MNIST','train'),
++            test_data_dir= os.path.join(data_cache_dir,'MNIST','test'),
++        )
++        #print("Dictionaries ready ..")
++
++def download_mnist(data_cache_dir):
++    if not os.path.exists(data_cache_dir):
++        os.makedirs(data_cache_dir)
++
++    file_path = os.path.join(data_cache_dir,"MNIST.zip") 
++
++    # Download the file (if we haven't already)
++    if not os.path.exists(file_path):
++        wget.download(FEDML_DATA_MNIST_URL, out=file_path)
++
++    with zipfile.ZipFile(file_path, "r") as zip_ref:
++        zip_ref.extractall(data_cache_dir)
++
++def read_data(train_data_dir, test_data_dir):
++
++    train_files = os.listdir(train_data_dir)
++    train_files = [f for f in train_files if f.endswith(".json")]
++    for f in train_files:
++        file_path = os.path.join(train_data_dir, f)
++        with open(file_path, encoding='utf-8', errors='ignore') as inf:
++            train_data = json.load(inf)
++
++    train_data['user_data_label'] = dict()
++    for user in train_data['user_data']:
++        train_data['user_data_label'][user] = train_data['user_data'][user]['y']
++        train_data['user_data'][user] = train_data['user_data'][user]['x']
++    
++    test_files = os.listdir(test_data_dir)
++    test_files = [f for f in test_files if f.endswith(".json")]
++    for f in test_files:
++        file_path = os.path.join(test_data_dir, f)
++        with open(file_path,  encoding='utf-8', errors='ignore') as inf:
++            test_data = json.load(inf)  
++        
++    test_data['user_data_label'] = dict()
++    for user in test_data['user_data']:
++        test_data['user_data_label'][user] = test_data['user_data'][user]['y']
++        test_data['user_data'][user] = test_data['user_data'][user]['x']
++        
++    return train_data, test_data
+\ No newline at end of file
+diff --git a/examples/simulation_lr_mnist/main.py b/examples/simulation_lr_mnist/main.py
+new file mode 100644
+index 0000000..f82ef5a
+--- /dev/null
++++ b/examples/simulation_lr_mnist/main.py
+@@ -0,0 +1,187 @@
++import argparse
++import flwr as fl
++from flwr.common.typing import Scalar
++import ray
++import torch
++import torchvision
++import numpy as np
++from collections import OrderedDict
++from pathlib import Path
++from typing import Dict, Callable, Optional, Tuple, List
++from dataset_utils import get_mnist, get_dataloader
++from utils import Net, train, test
++from dataloader import DataLoader
++
++parser = argparse.ArgumentParser(description="Flower Simulation with PyTorch")
++
++parser.add_argument("--num_client_cpus", type=int, default=1)
++parser.add_argument("--num_rounds", type=int, default=5)
++
++
++# Flower client, adapted from Pytorch quickstart example
++class FlowerClient(fl.client.NumPyClient):
++    def __init__(self, cid, trainset, testset):
++        self.cid = cid
++        self.trainset = trainset
++        self.testset = testset
++        self.properties: Dict[str, Scalar] = {"tensor_type": "numpy.ndarray"}
++
++        # Instantiate model
++        self.net = Net()
++
++        # Determine device
++        torch.set_num_threads(2)
++        self.device = torch.device("cpu")
++
++    def get_parameters(self, config):
++        return get_params(self.net)
++
++    def fit(self, parameters, config):
++        set_params(self.net, parameters)
++
++        # Load data for this client and get trainloader
++        num_workers = int(ray.get_runtime_context().get_assigned_resources()["CPU"])
++        trainloader = get_dataloader(
++            self.trainset,
++            self.cid,
++            is_train=True,
++            batch_size=config["batch_size"],
++            workers=num_workers,
++        )
++
++        # Send model to device
++        self.net.to(self.device)
++
++        # Train
++        train(self.net, trainloader, epochs=config["epochs"], device=self.device)
++
++        # Return local model and statistics
++        return get_params(self.net), len(trainloader.dataset), {}
++
++    def evaluate(self, parameters, config):
++        set_params(self.net, parameters)
++
++        # Load data for this client and get trainloader
++        num_workers = int(ray.get_runtime_context().get_assigned_resources()["CPU"])
++        valloader = get_dataloader(
++            self.testset, self.cid, is_train=False, batch_size=50, workers=num_workers
++        )
++
++        # Send model to device
++        self.net.to(self.device)
++
++        # Evaluate
++        loss, accuracy = test(self.net, valloader, device=self.device)
++
++        # Return statistics
++        return float(loss), len(valloader.dataset), {"accuracy": float(accuracy)}
++
++
++def fit_config(server_round: int) -> Dict[str, Scalar]:
++    """Return a configuration with static batch size and (local) epochs."""
++    config = {
++        "epochs": 5,  # number of local epochs
++        "batch_size": 64,
++    }
++    return config
++
++
++def get_params(model: torch.nn.ModuleList) -> List[np.ndarray]:
++    """Get model weights as a list of NumPy ndarrays."""
++    return [val.cpu().numpy() for _, val in model.state_dict().items()]
++
++
++def set_params(model: torch.nn.ModuleList, params: List[np.ndarray]):
++    """Set model weights from a list of NumPy ndarrays."""
++    params_dict = zip(model.state_dict().keys(), params)
++    state_dict = OrderedDict({k: torch.from_numpy(np.copy(v)) for k, v in params_dict})
++    model.load_state_dict(state_dict, strict=True)
++
++
++def get_evaluate_fn(testset) -> Callable[[fl.common.NDArrays], Optional[Tuple[float, float]]]:
++    """Return an evaluation function for centralized evaluation."""
++
++    def evaluate(
++        server_round: int, parameters: fl.common.NDArrays, config: Dict[str, Scalar]
++    ) -> Optional[Tuple[float, float]]:
++        """Use the entire CIFAR-10 test set for evaluation."""
++
++        # determine device
++        torch.set_num_threads(2)
++        device = torch.device("cpu")
++
++        model = Net()
++        set_params(model, parameters)
++        model.to(device)
++
++        testloader = DataLoader(testset, batch_size=50, num_workers=2, mode="val") 
++        loss, accuracy = test(model, testloader, device=device)
++
++        # return statistics
++        return loss, {"accuracy": accuracy}
++
++    return evaluate
++
++
++# Start simulation (a _default server_ will be created)
++# This example does:
++# 1. Downloads CIFAR-10
++# 2. Partitions the dataset into N splits, where N is the total number of
++#    clients. We refere to this as `pool_size`. The partition can be IID or non-IID
++# 3. Starts a simulation where a % of clients are sample each round.
++# 4. After the M rounds end, the global model is evaluated on the entire testset.
++#    Also, the global model is evaluated on the valset partition residing in each
++#    client. This is useful to get a sense on how well the global model can generalise
++#    to each client's data.
++if __name__ == "__main__":
++    import os 
++
++    os.environ["RAY_PROFILING"] = "1"
++    # parse input arguments
++    args = parser.parse_args()
++
++    pool_size = 1000  # number of dataset partions (= number of total clients)
++    client_resources = {
++        "num_cpus": args.num_client_cpus,
++        #"num_gpus": 1,
++    }  # each client will get allocated 1 CPUs
++
++    # Download CIFAR-10 dataset
++    trainset, testset = get_mnist()
++
++    # partition dataset (use a large `alpha` to make it IID;
++    # a small value (e.g. 1) will make it non-IID)
++    # This will create a new directory called "federated": in the directory where
++    # CIFAR-10 lives. Inside it, there will be N=pool_size sub-directories each with
++    # its own train/set split.
++    # fed_dir = do_fl_partitioning(
++    #     train_path, pool_size=pool_size, alpha=1, num_classes=10, val_ratio=0.1
++    # )
++    fed_dir = "./data"
++    # configure the strategy
++    strategy = fl.server.strategy.FedAvg(
++        fraction_fit=0.01,
++        fraction_evaluate=1.0,
++        min_fit_clients=10,
++        min_evaluate_clients=10,
++        min_available_clients=pool_size,  # All clients should be available
++        on_fit_config_fn=fit_config,
++        evaluate_fn=get_evaluate_fn(testset),  # centralised evaluation of global model
++    )
++
++    def client_fn(cid):
++        # create a single client instance
++        return FlowerClient(cid, trainset, testset)
++
++    # (optional) specify Ray config
++    ray_init_args = {"include_dashboard": False}
++
++    # start simulation
++    fl.simulation.start_simulation(
++        client_fn=client_fn,
++        num_clients=pool_size,
++        client_resources=client_resources,
++        config=fl.server.ServerConfig(num_rounds=args.num_rounds),
++        strategy=strategy,
++        ray_init_args=ray_init_args,
++    )
+diff --git a/examples/simulation_lr_mnist/pyproject.toml b/examples/simulation_lr_mnist/pyproject.toml
+new file mode 100644
+index 0000000..cb0df02
+--- /dev/null
++++ b/examples/simulation_lr_mnist/pyproject.toml
+@@ -0,0 +1,15 @@
++[build-system]
++requires = ["poetry_core>=1.0.0"]
++build-backend = "poetry.core.masonry.api"
++
++[tool.poetry]
++name = "simulation_pytorch"
++version = "0.1.0"
++description = "Federated Learning Simulation with Flower and PyTorch"
++authors = ["The Flower Authors <hello@flower.dev>"]
++
++[tool.poetry.dependencies]
++python = "^3.7"
++flwr = { extras = ["simulation"], version = "^1.0.0" }
++torch = "^1.12.0"
++torchvision = "^0.13.0"
+diff --git a/examples/simulation_lr_mnist/requirements.txt b/examples/simulation_lr_mnist/requirements.txt
+new file mode 100644
+index 0000000..94b66e4
+--- /dev/null
++++ b/examples/simulation_lr_mnist/requirements.txt
+@@ -0,0 +1,3 @@
++flwr==1.0.0
++torch==1.12.0
++torchvision==0.13.0
+diff --git a/examples/simulation_lr_mnist/run.sh b/examples/simulation_lr_mnist/run.sh
+new file mode 100755
+index 0000000..2ab07a0
+--- /dev/null
++++ b/examples/simulation_lr_mnist/run.sh
+@@ -0,0 +1,14 @@
++#!/bin/bash
++set -e
++cd "$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"/
++
++# Download the CIFAR-10 dataset
++python -c "from torchvision.datasets import CIFAR10; CIFAR10('./data', download=True)"
++
++echo "Start simulation"
++python main.py &
++
++# Enable CTRL+C to stop all background processes
++trap "trap - SIGTERM && kill -- -$$" SIGINT SIGTERM
++# Wait for all background processes to complete
++wait
+diff --git a/examples/simulation_lr_mnist/utils.py b/examples/simulation_lr_mnist/utils.py
+new file mode 100644
+index 0000000..5260c0d
+--- /dev/null
++++ b/examples/simulation_lr_mnist/utils.py
+@@ -0,0 +1,49 @@
++import torch
++import torch.nn as nn
++import torch.nn.functional as F
++
++
++# Model (simple CNN adapted from 'PyTorch: A 60 Minute Blitz')
++# borrowed from Pytorch quickstart example
++class Net(torch.nn.Module):
++    def __init__(self, input_dim=784, output_dim=10):
++        super(Net, self).__init__()
++        self.linear = torch.nn.Linear(input_dim, output_dim)
++
++    def forward(self, x):
++        o = self.linear(x.view(-1,28*28))
++        outputs = torch.sigmoid(o)
++        #outputs = torch.sigmoid(self.linear(x))
++        return outputs
++
++# borrowed from Pytorch quickstart example
++def train(net, trainloader, epochs, device: str):
++    """Train the network on the training set."""
++    criterion = torch.nn.CrossEntropyLoss()
++    optimizer = torch.optim.SGD(net.parameters(), lr=0.03)
++    net.train()
++    for _ in range(epochs):
++        for batch in trainloader:
++            images, labels = batch['x'].to(device), batch['y'].to(device)
++            optimizer.zero_grad()
++            loss = criterion(net(images), labels.long())
++            loss.backward()
++            optimizer.step()
++
++
++# borrowed from Pytorch quickstart example
++def test(net, testloader, device: str):
++    """Validate the network on the entire test set."""
++    criterion = torch.nn.CrossEntropyLoss()
++    correct, total, loss = 0, 0, 0.0
++    net.eval()
++    with torch.no_grad():
++        for data in testloader:
++            images, labels = data['x'].to(device), data['y'].to(device)
++            outputs = net(images)
++            loss += criterion(outputs, labels.long()).item()
++            _, predicted = torch.max(outputs.data, 1)
++            total += labels.size(0)
++            correct += (predicted == labels).sum().item()
++    accuracy = correct / total
++    return loss, accuracy
+diff --git a/src/py/flwr/server/server.py b/src/py/flwr/server/server.py
+index da43f77..f0a8ca2 100644
+--- a/src/py/flwr/server/server.py
++++ b/src/py/flwr/server/server.py
+@@ -110,34 +110,35 @@ class Server:
+                     self.parameters = parameters_prime
+ 
+             # Evaluate model using strategy implementation
+-            res_cen = self.strategy.evaluate(current_round, parameters=self.parameters)
+-            if res_cen is not None:
+-                loss_cen, metrics_cen = res_cen
+-                log(
+-                    INFO,
+-                    "fit progress: (%s, %s, %s, %s)",
+-                    current_round,
+-                    loss_cen,
+-                    metrics_cen,
+-                    timeit.default_timer() - start_time,
+-                )
+-                history.add_loss_centralized(server_round=current_round, loss=loss_cen)
+-                history.add_metrics_centralized(
+-                    server_round=current_round, metrics=metrics_cen
+-                )
+-
+-            # Evaluate model on a sample of available clients
+-            res_fed = self.evaluate_round(server_round=current_round, timeout=timeout)
+-            if res_fed:
+-                loss_fed, evaluate_metrics_fed, _ = res_fed
+-                if loss_fed:
+-                    history.add_loss_distributed(
+-                        server_round=current_round, loss=loss_fed
++            if current_round % 100 == 0:
++                res_cen = self.strategy.evaluate(current_round, parameters=self.parameters)
++                if res_cen is not None:
++                    loss_cen, metrics_cen = res_cen
++                    log(
++                        INFO,
++                        "fit progress: (%s, %s, %s, %s)",
++                        current_round,
++                        loss_cen,
++                        metrics_cen,
++                        timeit.default_timer() - start_time,
+                     )
+-                    history.add_metrics_distributed(
+-                        server_round=current_round, metrics=evaluate_metrics_fed
++                    history.add_loss_centralized(server_round=current_round, loss=loss_cen)
++                    history.add_metrics_centralized(
++                        server_round=current_round, metrics=metrics_cen
+                     )
+ 
++                # Evaluate model on a sample of available clients
++                res_fed = self.evaluate_round(server_round=current_round, timeout=timeout)
++                if res_fed:
++                    loss_fed, evaluate_metrics_fed, _ = res_fed
++                    if loss_fed:
++                        history.add_loss_distributed(
++                            server_round=current_round, loss=loss_fed
++                        )
++                        history.add_metrics_distributed(
++                            server_round=current_round, metrics=evaluate_metrics_fed
++                        )
++
+         # Bookkeeping
+         end_time = timeit.default_timer()
+         elapsed = end_time - start_time
+@@ -233,7 +234,8 @@ class Server:
+             len(results),
+             len(failures),
+         )
+-
++        #print(f"************* Failures {failures}")
++        #print(f"************* Results {results}")
+         # Aggregate training results
+         aggregated_result: Tuple[
+             Optional[Parameters],
+@@ -332,7 +334,7 @@ def fit_clients(
+             fs=submitted_fs,
+             timeout=None,  # Handled in the respective communication stack
+         )
+-
++    #print(f" --------- Finished_fs {finished_fs}")
+     # Gather results
+     results: List[Tuple[ClientProxy, FitRes]] = []
+     failures: List[Union[Tuple[ClientProxy, FitRes], BaseException]] = []
+@@ -348,6 +350,7 @@ def fit_client(
+ ) -> Tuple[ClientProxy, FitRes]:
+     """Refine parameters on a single client."""
+     fit_res = client.fit(ins, timeout=timeout)
++    #print(f"************** Fit res {fit_res}")
+     return client, fit_res
+ 
+ 
+@@ -359,6 +362,7 @@ def _handle_finished_future_after_fit(
+     """Convert finished future into either a result or a failure."""
+ 
+     # Check if there was an exception
++    #print(future.add_done_callback())
+     failure = future.exception()
+     if failure is not None:
+         failures.append(failure)
+@@ -372,7 +376,7 @@ def _handle_finished_future_after_fit(
+     if res.status.code == Code.OK:
+         results.append(result)
+         return
+-
++    #print(f" ************ Inside _handle_finished {failures}")
+     # Not successful, client returned a result where the status code is not OK
+     failures.append(result)
+ 
+-- 
+2.25.1
+
